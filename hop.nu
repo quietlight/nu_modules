@@ -1,8 +1,8 @@
 # hop.nu — interactive back-and-forth over op sessions ("hop between turns").
 #
 # hop is the interactive loop op itself deliberately doesn't have: op stays a
-# one-shot primitive, and this wrapper threads `sessionId` from each --json
-# result into the next call's --sessionId. The module exports `main`, so
+# one-shot primitive, and this wrapper threads `sessionId` from each run's
+# result line into the next call's --sessionId. The module exports `main`, so
 # `use hop.nu` gives you a bare `hop` command:
 #
 #   use ~/nu_modules/hop.nu
@@ -19,11 +19,8 @@
 # completer-input) injects a reader that wires the completer in; without it
 # Tab is inert and everything else works.
 #
-# Each send runs `op --json` and prints only the answer and a stats line; the
-# tool calls along the way stay off screen. `:v` shows the full transcript of
-# the current branch, rendered by pi-session-view straight from the session
-# file — hop reads op's documented outputs (the result envelope, the session
-# log) and depends on nothing else of op's.
+# Turns render live from `op --stream`, so there is no transcript command:
+# to re-read an old session, run `op --render --sessionId <id>` directly.
 #
 # The module is shaped like an Elm program — model, msg, update, view — with
 # the one concession an interactive shell forces: update runs its effects (op
@@ -33,11 +30,9 @@
 # whole behaviour, and everything above them is the view and the effects they
 # lean on. New commands slot in as a `parse-line` arm plus an `update` arm.
 
-use pi-session-view.nu
-
 # ── view ─────────────────────────────────────────────────────────────────────
-# Everything hop prints on its own behalf; `:v` hands transcripts to
-# pi-session-view.
+# Everything hop prints on its own behalf. op's turns are not rendered here:
+# they stream through `op --render` inside send-op.
 
 def dim [text: string] { print $"(ansi dark_gray)($text)(ansi reset)" }
 
@@ -90,11 +85,10 @@ def status-line [res] {
     if $gauge == "" { $dimmed } else { $"($dimmed) ($gauge)" }
 }
 
-# What a send prints: the answer, op's error if any, the stats line, and the
-# handoff nudge when the gauge trips.
+# The footer after a send: op's error if any, the stats line, and the handoff
+# nudge when the gauge trips. The answer itself already printed as it streamed
+# (the final assistant entry), so the result contributes only this.
 def show-result [res] {
-    let answer = ($res | get -o answer | default "")
-    if $answer != "" { print $answer }
     if ($res | get -o error) != null {
         err $res.error
         if ($res | get -o hint) != null { dim $res.hint }
@@ -111,25 +105,36 @@ def show-result [res] {
 # update. The one licence: interactive pickers render their own chrome — the
 # instruction line above an `input list` is part of the picker, not a verdict.
 
-# A session's .jsonl file under ~/.op_global/sessions (any project dir), or
-# null when there is none.
-def session-file [session: string] {
-    glob ($nu.home-dir | path join ".op_global" "sessions" "*" $"*_($session).jsonl")
-    | get -o 0
+# What the live view leaves out of the stream it hands to `op --render`: the
+# user's own message (hop just watched them type it) and the closing result
+# line (hop prints its own footer from it, in show-result).
+def off-screen [line: string]: nothing -> bool {
+    let e = try { $line | from json } catch { null }
+    if $e == null { return false }
+    let type = $e | get -o type
+    $type == "result" or ($type == "message" and (($e | get -o message | get -o role) == "user"))
 }
 
-# Run op --json and always return a record; a hard crash that produces no JSON
+# Run op --stream and return the run's final result record, rendering the turn
+# as it happens. The streamed lines are exactly the session file's, so a second
+# op — `op --render`, reading them on stdin — prints the same transcript a
+# plain `op` run would: `tee` hands it a copy of the stream while this pipeline
+# keeps the original to find the result line in. One renderer, op's own, for
+# both the direct and the hop view. A hard crash that produces no result line
 # (op normally emits an error envelope even on exit 1) becomes an error record
-# of the same shape instead of throwing mid-chat. `complete` rather than
-# try/catch for the same reason as handoff-draft: an exit-1 envelope must still
-# be read. It also swallows op's stderr resume line, which hop prints itself.
+# of the same shape instead of throwing mid-chat.
 def send-op [args: list<string>] {
-    let out = (^op --json ...$args | complete)
-    if ($out.stdout | str trim | is-empty) {
-        return {isError: true, error: $"op produced no output \(exit ($out.exit_code))"}
-    }
-    try { $out.stdout | from json } catch {
-        {isError: true, error: $"op output was not JSON \(exit ($out.exit_code))"}
+    let results = (
+        ^op --stream ...$args
+        | tee { lines | where {|l| not (off-screen $l) } | to text | ^op --render }
+        | lines
+        | each {|l| try { $l | from json } catch { null } }
+        | where {|e| ($e | describe | str starts-with "record") and ($e | get -o type) == "result" }
+    )
+    if ($results | is-empty) {
+        {isError: true, error: "op produced no result line"}
+    } else {
+        $results | last
     }
 }
 
@@ -279,7 +284,6 @@ def parse-line [raw: string] {
         ":m" => ({msg: "model", arg: $arg})
         ":h" => ({msg: "handoff", arg: $arg})
         ":e" => ({msg: "edit", arg: $arg})
-        ":v" => ({msg: "view", arg: ""})
         _ => ({msg: "send", arg: $line})
     }
 }
@@ -315,21 +319,6 @@ def update-browse [state: record, arg: string] {
     }
     dim $"next send resumes session ($owner.0.id) forked at ($picked)"
     $state | merge {session: $owner.0.id, parent: $picked}
-}
-
-# :v — the transcript of the branch hop is on: from the session root to the
-# entry the next send attaches to. With no known leaf (a resumed session whose
-# tip was never picked) that is ambiguous, so the whole file is shown.
-def update-view [state: record] {
-    let file = if $state.session == null { null } else { session-file $state.session }
-    if $file == null {
-        dim "no session to view yet"
-    } else if $state.parent == null {
-        pi-session-view $file
-    } else {
-        pi-session-view $file --leaf $state.parent
-    }
-    $state
 }
 
 # :m — with an argument, set the override directly; bare, fetch op's model
@@ -484,7 +473,6 @@ def update [state: record, cfg: record, msg: record] {
         "model" => (update-model $state $msg.arg)
         "handoff" => (update-handoff $state $cfg $msg.arg)
         "edit" => (update-edit $state $cfg $msg.arg)
-        "view" => (update-view $state)
         "send" => (update-send $state $cfg $msg.arg)
         # A match with no matching arm returns nothing, so without this a
         # `parse-line` kind added without its counterpart here would set $state
@@ -514,7 +502,6 @@ def update [state: record, cfg: record, msg: record] {
 #               lists op's models in a fuzzy picker (type to filter, Enter
 #               sets, Esc keeps the current override)
 #   :n          next send starts a fresh session (re-injecting --context)
-#   :v          view the current branch's transcript (tool calls and all)
 #   :q          quit (ctrl-d also works; ctrl-c only clears the current line,
 #               so it stays free for copying out of the terminal)
 # The editor buffer is one temp file kept for the whole chat, so it doubles as
@@ -522,7 +509,7 @@ def update [state: record, cfg: record, msg: record] {
 export def main [
     --model (-m): string    # provider/model override for every send
     --profile: string       # capability profile (a name from nuProfiles)
-    --tools: string         # tool set for every send, e.g. read,edit — or
+    --tools: string         # tool set for every send, e.g. read,glob — or
                             # "none" for a pure chat (a profile with a tools
                             # list, e.g. --profile chat, does this too)
     --session: string       # pick up an existing session instead of starting fresh
@@ -559,7 +546,7 @@ export def main [
             } else { [] }
         }
     }
-    dim "@path TAB -> attach context · :e [file] -> edit prompt · :h [goal] -> handoff · :l [n] -> browse sessions · :m [model] -> pick/set model · :n -> new thread · :v -> view transcript · :q -> quit"
+    dim "@path TAB -> attach context · :e [file] -> edit prompt · :h [goal] -> handoff · :l [n] -> browse sessions · :m [model] -> pick/set model · :n -> new thread · :q -> quit"
     # Same choice :l makes on a pick, made once for --session: a branched
     # session cannot be resumed without naming a tip, and being asked beats
     # being told so by the first send. Resolved before `init` so that `init`

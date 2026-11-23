@@ -4,7 +4,6 @@
 # Usage:
 #   use pi-session-view.nu
 #   pi-session-view /path/to/session.jsonl
-#   pi-session-view /path/to/session.jsonl --leaf <entry-id>   # one branch
 #
 # The session format is documented in op's docs/pi-session-format.md.
 # Each line of the file is a JSON object; the first is the "session" header
@@ -13,16 +12,18 @@
 # not know how to render are silently skipped, and missing optional fields are
 # tolerated so a partial/crashed log still displays.
 #
-# hop's `:v` uses this module to show the current branch of its session. It is
-# deliberately independent of op: op's own renderer (`lib/render.ml`, also
-# reachable as `op --render`) is op's business, and this one reads the session
-# file — the documented interface — without going through op at all.
+# KEPT AS AN EXAMPLE. Nothing in op calls this module any more: `op --render`
+# replays a session file (or a piped `op --stream`) through op's own renderer,
+# `lib/render.ml`, and hop uses that. This file stays because it is good
+# Nushell to read and to borrow from — it was the strongest entry in a
+# which-model-writes-the-best-nu comparison — and because it still works on
+# its own for any op or pi session log.
 #
 # It was written as the twin of `lib/render.ml`: the constants below are that
 # module's line budgets and the layout is its `head` (a blank line before each
 # USER/ASSISTANT header and nowhere else, `→`/`←` heads with the tool name in a
-# five-wide column, bodies indented four). It is not kept in step, so expect
-# small drift from op's transcript as render.ml changes. One difference
+# five-wide column, bodies indented four). It is no longer kept in step, so
+# expect it to drift from op's transcript as render.ml changes. One difference
 # was always deliberate: this module keeps a checklist renderer for `todo`
 # entries (legacy op sessions and pi's todo.ts carry list state in the
 # toolResult `details`), where render.ml shows them through its generic
@@ -414,7 +415,8 @@ def render-model-change [e] {
 # A toolResult names its call by id and nothing else, so naming the file a read
 # result came from means remembering the call — render.ml keeps a hashtable for
 # exactly this. Here the map is passed in: `main` builds it in one pass over the
-# file, since a closure cannot carry mutable state between entries.
+# file, and hop threads it through its stream (see hop.nu's send-op), since a
+# closure cannot carry mutable state between entries.
 
 # The {id: arguments} pairs an entry contributes. Empty for everything that is
 # not an assistant turn with tool calls.
@@ -432,10 +434,11 @@ export def calls-of [e: record]: nothing -> record {
 
 # --- entry point -----------------------------------------------------------
 
-# Render one parsed entry record. Exported so a caller holding entries from
-# elsewhere (a live `op --stream`, say) can render them one at a time. Unknown
-# entry types print nothing, so a newer op writing an entry this renderer
-# predates is silently tolerated rather than fatal.
+# Render one parsed entry record. Exported because the same dispatch serves
+# both a finished file (`main`, below) and a live `op --stream` (hop reads the
+# entries off stdout as they are appended) — one renderer, two arrival times.
+# Unknown entry types print nothing, so a newer op streaming an entry this
+# renderer predates is silently tolerated rather than fatal.
 #
 # `calls` is the {id: arguments} map from `calls-of`; omitting it costs only the
 # path on a read result's summary line.
@@ -448,36 +451,14 @@ export def render-entry [e: record, calls: record = {}] {
     }
 }
 
-# The entries on one branch: walk parentId links from $leaf to the root and
-# reverse, as op does to rebuild a session's context (pi-session-format.md).
-# The session header has no parentId and sits outside the tree, so it is kept
-# in front. An unknown $leaf yields just the header.
-def on-branch [entries: list, leaf: string]: nothing -> list {
-    let header = ($entries | where {|e| ($e | get -o type) == "session"})
-    let index = (
-        $entries
-        | where {|e| ($e | get -o type) != "session" and ($e | get -o id) != null}
-        | reduce --fold {} {|e, acc| $acc | upsert $e.id $e }
-    )
-    let path = (generate {|id|
-        let e = if $id == null { null } else { $index | get -o $id }
-        if $e == null { {} } else { {out: $e, next: ($e | get -o parentId)} }
-    } $leaf)
-    $header ++ ($path | reverse)
-}
-
-export def main [
-    file: path
-    --leaf: string  # render only the branch ending at this entry id
-] {
-    let all = (
+export def main [file: path] {
+    let entries = (
         open --raw $file
         | lines
         | where {|l| ($l | str trim | is-not-empty)}
         | each {|l| try { $l | from json } catch { null } }
         | compact
     )
-    let entries = if $leaf == null { $all } else { on-branch $all $leaf }
     # The session header's cwd is the root paths are shown relative to; a gate
     # log or a headerless fragment falls back to the working directory.
     let header = ($entries | where {|e| ($e | get -o type) == "session"} | get -o 0)
