@@ -85,6 +85,22 @@ def edit-buffer [buf: path] {
     (ls $buf | get 0.modified) != $before
 }
 
+# Give each editor invocation its own scratch file and keep it through the send.
+def edit-and-send [state: record, cfg: record, seed: string, from: any, unsaved: string] {
+    let buf = (mktemp -t --suffix .md hop-XXXXXXXXXX)
+    try {
+        $seed | save --force $buf
+        if (edit-buffer $buf) {
+            run-send $state $cfg {prompt: ["--prompt" $buf], from: $from, contexts: []}
+        } else {
+            dim $unsaved
+            $state
+        }
+    } finally {
+        rm --force --permanent $buf
+    }
+}
+
 # Recent sessions for cwd (newest first) with nested messages table for explore.
 def session-tree [limit: int] {
     ^op --json --list sessions --limit $limit
@@ -243,31 +259,22 @@ def update-handoff [state: record, cfg: record, goal: string] {
         err ($res | get -o error | default "handoff failed")
         return $state
     }
-    $res.handoffPrompt | save --force $cfg.buf
-    if not (edit-buffer $cfg.buf) {
-        dim "draft not saved — nothing sent"
-        return $state
-    }
-    run-send $state $cfg {prompt: ["--prompt" $cfg.buf], from: $state.session, contexts: []}
+    edit-and-send $state $cfg $res.handoffPrompt $state.session "draft not saved — nothing sent"
 }
 
 # :e — compose prompt in $EDITOR, optionally seeded from skills/<skill>.md.
 def update-edit [state: record, cfg: record, skill: string] {
-    if $skill != "" {
-        let seed = $"skills/($skill).md"
-        if not ($seed | path exists) {
-            dim $"no skill file ($seed)"
+    let seed = if $skill == "" {
+        ""
+    } else {
+        let path = $"skills/($skill).md"
+        if not ($path | path exists) {
+            dim $"no skill file ($path)"
             return $state
         }
-        open --raw $seed | save --force $cfg.buf
-    } else if not ($cfg.buf | path exists) {
-        touch $cfg.buf
+        open --raw $path
     }
-    if not (edit-buffer $cfg.buf) {
-        dim "buffer not saved — nothing sent"
-        return $state
-    }
-    run-send $state $cfg {prompt: ["--prompt" $cfg.buf], from: null, contexts: []}
+    edit-and-send $state $cfg $seed null "buffer not saved — nothing sent"
 }
 
 # Plain prompt: attach existing @path tokens via --context (non-files like @skill pass through).
@@ -362,7 +369,6 @@ export def main [
     --max-steps: int        # step cap per send
 ] {
     let cfg = {
-        buf: ($nu.temp-dir | path join $"hop-(random uuid).md")
         history: ($nu.home-dir | path join ".op_global" "hop_history.txt")
         profile: $profile
         tools: $tools
